@@ -1,0 +1,2 @@
+include ':multi-platform-ble-adapter'
+project(':multi-platform-ble-adapter').projectDir = new File(rootProject.projectDir, '/../../MultiPlatformBleAdapter/android/library')

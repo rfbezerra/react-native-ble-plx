@@ -1,5 +1,9 @@
 package com.polidea.reactnativeble;
 
+import android.annotation.TargetApi;
+import android.bluetooth.BluetoothGatt;
+import android.os.Build;
+
 import com.facebook.react.bridge.Arguments;
 import com.facebook.react.bridge.Promise;
 import com.facebook.react.bridge.ReactApplicationContext;
@@ -33,14 +37,29 @@ import com.polidea.reactnativeble.converter.ScanResultToJsObjectConverter;
 import com.polidea.reactnativeble.converter.ServiceToJsObjectConverter;
 import com.polidea.reactnativeble.utils.ReadableArrayConverter;
 import com.polidea.reactnativeble.utils.SafePromise;
+import com.polidea.reactnativeble.utils.UUIDConverter;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.IOException;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
+import java.util.UUID;
 
 import androidx.annotation.NonNull;
 import androidx.annotation.Nullable;
 
+import br.com.vertitecnologia.vmpay.utils.Base32768Util;
+import br.com.vertitecnologia.vmpay.utils.CRC16Util;
+import br.com.vertitecnologia.vmpay.utils.FileUtil;
+import br.com.vertitecnologia.vmpay.utils.StringUtil;
+import br.com.vertitecnologia.vmpay.vmbox.Package;
 
 public class BleClientManager extends ReactContextBaseJavaModule {
 
@@ -929,5 +948,215 @@ public class BleClientManager extends ReactContextBaseJavaModule {
         getReactApplicationContext()
                 .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class)
                 .emit(event.name, params);
+    }
+
+    // Mark: Verti
+    private static final int BLOCK_SIZE = 180;
+    private static final Charset CHARSET = StandardCharsets.ISO_8859_1;
+    private static final UUID serviceUUID = UUIDConverter.convert("ffe0");
+    private static final UUID characteristicUUID = UUIDConverter.convert("ffe1");
+
+    /* Arquivos configuração e firmware smart e mob v1 */
+    private static class FileBlock {
+        String number;
+        String data;
+
+        FileBlock(String number, String data) {
+            this.number = number;
+            this.data = data;
+        }
+
+        FileBlock(int number, String data) {
+            this(String.format(Locale.US, "%02x%02x", number & 0xff, (number >> 8) & 0xff), data);
+        }
+
+        List<String> toArray() {
+            return Arrays.asList(number, data);
+        }
+
+        static FileBlock first(int type) {
+            return new FileBlock(0, String.format(Locale.US, "%02d", type));
+        }
+
+        static FileBlock last() {
+            return new FileBlock("FFFF", "");
+        }
+    }
+
+    private final List<FileBlock> fileDataBlocks = new ArrayList<>();
+
+    private List<String> buildBlocks(byte[] data) throws IOException {
+        List<String> blocks = new ArrayList<>();
+        for (int i = 0; i <= (data.length / BLOCK_SIZE); i++) {
+            int from = i * BLOCK_SIZE;
+            int to = Math.min(from + BLOCK_SIZE, data.length);
+
+            byte[] blockData = Arrays.copyOfRange(data, from, to);
+            ByteArrayInputStream bis = new ByteArrayInputStream(blockData);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            Base32768Util.encode(bis, bos);
+
+            blocks.add(StringUtil.byteArrayToString(bos.toByteArray(), CHARSET));
+        }
+        return blocks;
+    }
+
+    @ReactMethod
+    public void loadFileBlocks(String path, int type, Promise promise) {
+        try {
+            /* 0 - Configuracao | 1 - Firmware */
+            byte[] fileData = (type == 0) ?
+                    FileUtil.readBytes(path) : FileUtil.readBytesFromPackageUpdateZip(path);
+            if (fileData == null) {
+                promise.reject(new RuntimeException("Error while load zip file data"));
+                return;
+            }
+
+            List<String> blocks = buildBlocks(fileData);
+            int blockNo = 1;
+            this.fileDataBlocks.clear();
+            this.fileDataBlocks.add(FileBlock.first(type));
+            for (String data : blocks) {
+                this.fileDataBlocks.add(new FileBlock(blockNo, data));
+                blockNo += 1;
+            }
+            this.fileDataBlocks.add(FileBlock.last());
+
+            WritableMap ret = Arguments.createMap();
+            ret.putInt("size", this.fileDataBlocks.size());
+            promise.resolve(ret);
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @ReactMethod
+    public void clearFileData(final Promise promise) {
+        this.fileDataBlocks.clear();
+        promise.resolve(true);
+    }
+
+    @ReactMethod
+    public void sendFileBlock(String deviceUUID, int pkgNo, int blockNo, final Promise promise) {
+        final SafePromise safePromise = new SafePromise(promise);
+
+        FileBlock block = this.fileDataBlocks.get(blockNo);
+        String cmd = new Package(pkgNo, "07", block.toArray()).toCommand();
+        bleAdapter.longWriteCharacteristic(
+                deviceUUID,
+                serviceUUID.toString(),
+                characteristicUUID.toString(),
+                cmd.getBytes(CHARSET),
+                false,
+                null,
+                new OnSuccessCallback<Characteristic>() {
+                    @Override
+                    public void onSuccess(Characteristic data) {
+                        safePromise.resolve(characteristicConverter.toJSObject(data));
+                    }
+                }, new OnErrorCallback() {
+                    @Override
+                    public void onError(BleError error) {
+                        safePromise.reject(null, errorConverter.toJs(error));
+                    }
+                }
+        );
+    }
+
+
+    /* Arquivos configuração e firmware mob v2 */
+    private byte[] mobfileData = new byte[0];
+
+    @ReactMethod
+    public void loadMobFile(String path, int type, final Promise promise) {
+        try {
+            /* 0 - Configuracao | 1 - FW STM | 2 - FW ESP */
+            this.mobfileData = (type == 0) ?
+                    FileUtil.readBytes(path) : FileUtil.readBytesFromPackageUpdateZip(path);
+
+            if (this.mobfileData == null) {
+                promise.reject(new RuntimeException("Error while load zip file data"));
+                return;
+            }
+
+            WritableMap ret = Arguments.createMap();
+            ret.putInt("size", this.mobfileData.length);
+            ret.putString("crc", CRC16Util.calculate(this.mobfileData));
+            promise.resolve(ret);
+        } catch (IOException ioe) {
+            promise.reject(ioe);
+        }
+    }
+
+    @ReactMethod
+    public void clearModFile(final Promise promise) {
+        mobfileData = new byte[0];
+        promise.resolve(true);
+    }
+
+    @ReactMethod
+    public void sendMobFile(String deviceUUID, int pkgNo, int offset, final Promise promise) {
+        final SafePromise safePromise = new SafePromise(promise);
+        try {
+            int to = Math.min(offset + BLOCK_SIZE, mobfileData.length);
+
+            final byte[] dataToSend = Arrays.copyOfRange(mobfileData, offset, to);
+            ByteArrayInputStream bis = new ByteArrayInputStream(dataToSend);
+            ByteArrayOutputStream bos = new ByteArrayOutputStream();
+            Base32768Util.encode(bis, bos);
+
+            String dataStr = StringUtil.byteArrayToString(bos.toByteArray(), CHARSET);
+            List<String> data = Arrays.asList(StringUtil.intToHex(offset, 4), dataStr);
+
+//            Log.i(VTAG, String.format("Escrevendo %s | %s", data.get(0), data.get(1)));
+            String cmd = new Package(pkgNo, "12", data).toCommand();
+//            Log.i(VTAG, String.format("Comando %s", cmd));
+
+            bleAdapter.longWriteCharacteristic(
+                    deviceUUID,
+                    serviceUUID.toString(),
+                    characteristicUUID.toString(),
+                    cmd.getBytes(CHARSET),
+                    false,
+                    null,
+                    new OnSuccessCallback<Characteristic>() {
+                        @Override
+                        public void onSuccess(Characteristic data) {
+                            safePromise.resolve(characteristicConverter.toJSObject(data));
+                        }
+                    }, new OnErrorCallback() {
+                        @Override
+                        public void onError(BleError error) {
+                            safePromise.reject(null, errorConverter.toJs(error));
+                        }
+                    }
+            );
+        } catch (IOException ioe) {
+//            Log.e(VTAG, ioe.getMessage());
+            safePromise.reject(ioe);
+        }
+    }
+
+    @TargetApi(Build.VERSION_CODES.LOLLIPOP)
+    @ReactMethod
+    public void setHighPriority(String deviceUUID, final Promise promise) {
+        final SafePromise safePromise = new SafePromise(promise);
+        bleAdapter.requestConnectionPriorityForDevice(
+                deviceUUID,
+                BluetoothGatt.CONNECTION_PRIORITY_HIGH,
+                null,
+                new OnSuccessCallback<Device>() {
+                    @Override
+                    public void onSuccess(Device data) {
+                        safePromise.resolve(deviceConverter.toJSObject(data));
+                    }
+                },
+                new OnErrorCallback() {
+                    @Override
+                    public void onError(BleError error) {
+                        safePromise.reject(null, errorConverter.toJs(error));
+                    }
+                }
+        );
     }
 }
